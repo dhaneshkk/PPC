@@ -594,6 +594,20 @@ def _compute_class_weights(samples: Sequence, num_classes: int) -> torch.Tensor:
     return weights
 
 
+def _resolve_loss_weights(samples: Sequence, uses_weighted_sampler: bool) -> torch.Tensor:
+    """Return CrossEntropy class weights, avoiding double rebalancing.
+
+    A WeightedRandomSampler already draws both classes uniformly in expectation; weighting the loss on
+    top of it corrects the imbalance twice and biases the model toward the minority class. With
+    ``--train_resampling balanced`` the samples are already balanced, so the computed weights are ~1.
+    """
+
+    if uses_weighted_sampler:
+        LOGGER.info("WeightedRandomSampler active; using uniform loss weights.")
+        return torch.ones(NUM_CLASSES, dtype=torch.float32)
+    return _compute_class_weights(samples, NUM_CLASSES)
+
+
 def _infer_accuracy(train_metrics: Dict[str, float], val_metrics: Optional[Dict[str, float]]) -> float:
     if val_metrics is not None:
         acc = val_metrics.get("accuracy")
@@ -954,8 +968,9 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         "Train split class counts before rebalancing: %s",
         ", ".join(f"{CLASS_ID_TO_NAME.get(cls, cls)}={count}" for cls, count in sorted(train_class_counts.items())),
     )
-    class_weights = _compute_class_weights(class_weight_samples, NUM_CLASSES).to(device)
-    LOGGER.info("Applying automatic loss weights: %s", ", ".join(f"{w:.3f}" for w in class_weights.tolist()))
+    class_weights = _resolve_loss_weights(class_weight_samples, uses_weighted_sampler=train_sampler is not None)
+    class_weights = class_weights.to(device)
+    LOGGER.info("Applying loss weights: %s", ", ".join(f"{w:.3f}" for w in class_weights.tolist()))
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     optimizer = torch.optim.AdamW(
