@@ -386,6 +386,7 @@ class TrainConfig:
     epochs: int = 30
     batch_size: int = 32
     train_resampling: str = "none"
+    select_metric: str = "possession_f1"
     lr: float = 1e-4
     weight_decay: float = 1e-4
     num_workers: int = 8
@@ -407,7 +408,6 @@ class TrainConfig:
     device: str = "auto"
     resume_from: Optional[Path] = None
     use_amp: bool = False
-    select_metric: str = "possession_f1"
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -595,6 +595,14 @@ def _compute_class_weights(samples: Sequence, num_classes: int) -> torch.Tensor:
     return weights
 
 
+def _infer_accuracy(train_metrics: Dict[str, float], val_metrics: Optional[Dict[str, float]]) -> float:
+    if val_metrics is not None:
+        acc = val_metrics.get("accuracy")
+        if acc is not None and not math.isnan(acc):
+            return float(acc)
+    return float(train_metrics.get("accuracy", 0.0))
+
+
 SELECTABLE_METRICS = ("possession_f1", "mcc", "macro_f1")
 
 
@@ -609,14 +617,6 @@ def _binary_mcc(confusion: np.ndarray) -> float:
     if denom <= 0.0:
         return 0.0
     return (tp * tn - fp * fn) / math.sqrt(denom)
-
-
-def _infer_accuracy(train_metrics: Dict[str, float], val_metrics: Optional[Dict[str, float]]) -> float:
-    if val_metrics is not None:
-        acc = val_metrics.get("accuracy")
-        if acc is not None and not math.isnan(acc):
-            return float(acc)
-    return float(train_metrics.get("accuracy", 0.0))
 
 
 def _prune_checkpoints(directory: Path, prefix: str, max_keep: int) -> None:
@@ -1816,6 +1816,13 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--val_ratio", type=float, default=0.2)
     train_parser.add_argument("--test_ratio", type=float, default=0.0)
     train_parser.add_argument("--seed", type=int, default=42)
+    train_parser.add_argument(
+        "--select_metric",
+        choices=SELECTABLE_METRICS,
+        default="possession_f1",
+        help="Validation metric used to pick the best checkpoint (default: possession_f1). "
+        "'mcc' (Matthews correlation) uses all four confusion-matrix cells and is robust to class imbalance.",
+    )
     train_parser.add_argument("--base_channels", type=int, default=32)
     train_parser.add_argument("--num_blocks", type=int, default=4)
     train_parser.add_argument("--dropout", type=float, default=0.3)
@@ -1863,13 +1870,6 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", type=str, default="auto")
     train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file.")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
-    train_parser.add_argument(
-        "--select_metric",
-        choices=SELECTABLE_METRICS,
-        default="possession_f1",
-        help="Validation metric used to pick the best checkpoint (default: possession_f1). "
-        "'mcc' (Matthews correlation) uses all four confusion-matrix cells and is robust to class imbalance.",
-    )
     train_parser.add_argument("--verbose", action="store_true")
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained checkpoint.")
@@ -1966,6 +1966,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
             seed=args.seed,
+            select_metric=args.select_metric,
             base_channels=args.base_channels,
             num_blocks=args.num_blocks,
             dropout=args.dropout,
@@ -1979,7 +1980,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=args.device,
             resume_from=args.resume,
             use_amp=args.use_amp,
-            select_metric=args.select_metric,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":

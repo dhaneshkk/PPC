@@ -161,6 +161,20 @@ def test_metrics_report_possession_and_macro_values() -> None:
     assert metrics["mcc"] == pytest.approx(6 / 540 ** 0.5)
 
 
+@pytest.mark.parametrize(
+    ("confusion", "expected"),
+    [
+        ([[5, 0], [0, 5]], 1.0),
+        ([[0, 5], [5, 0]], -1.0),
+        ([[10, 0], [3, 0]], 0.0),  # never predicts possession -> undefined, reported as 0
+        ([[0, 0], [0, 0]], 0.0),
+        ([[8, 2], [1, 1]], 6 / 540 ** 0.5),
+    ],
+)
+def test_binary_mcc(confusion, expected) -> None:
+    assert _binary_mcc(np.array(confusion)) == pytest.approx(expected)
+
+
 def test_checkpoint_contract_rejects_legacy_puc(tmp_path: Path) -> None:
     valid = {
         "model_family": PPC_MODEL_FAMILY,
@@ -219,17 +233,3 @@ def test_analysis_scripts_reject_three_class_onnx(tmp_path: Path) -> None:
         script = _load_script(filename)
         with pytest.raises(ValueError, match="must contain 2 probabilities"):
             script._load_model(model_path)
-
-
-@pytest.mark.parametrize(
-    ("confusion", "expected"),
-    [
-        ([[5, 0], [0, 5]], 1.0),
-        ([[0, 5], [5, 0]], -1.0),
-        ([[10, 0], [3, 0]], 0.0),  # never predicts possession -> undefined, reported as 0
-        ([[0, 0], [0, 0]], 0.0),
-        ([[8, 2], [1, 1]], 6 / 540 ** 0.5),
-    ],
-)
-def test_binary_mcc(confusion, expected) -> None:
-    assert _binary_mcc(np.array(confusion)) == pytest.approx(expected)
