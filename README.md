@@ -151,6 +151,7 @@ uv run python demo_phone_gaze_classification.py \
 - Pass `--rgb_to_yuv_to_y` to convert RGB crops to YUV, keep only the Y (luma) channel inside the network, and train a single-channel stem without modifying the dataloader.
 - Alternatively, use `--rgb_to_lab` or `--rgb_to_luv` to convert inputs to CIE Lab/Luv (3-channel) before the stem; these options are mutually exclusive with each other and with `--rgb_to_yuv_to_y`.
 - Mixed precision can be enabled with `--use_amp` when CUDA is available.
+- Sharpness-Aware Minimization: `--sam_rho 0.05` makes each step take its gradient at the worst-case point within an L2 ball of radius ρ around the weights (two forward/backward passes per step, so ~2x training time). `--sam_adaptive` switches to ASAM (scale-invariant; use a larger ρ such as 0.5–2.0). BatchNorm running statistics are only updated by the first pass, and it works with `--use_amp`. Disabled by default (`--sam_rho 0`).
 - Resume training with `--resume path/to/ppc_epoch_XXXX.pt`; all optimiser/scheduler/AMP states and history are restored.
 - Loss/accuracy/F1/MCC metrics are logged to TensorBoard under `output_dir`, and `tqdm` progress bars expose per-epoch progress for train/val/test loops.
 - `--select_metric {possession_f1,mcc,macro_f1}` picks the validation metric used to keep the best checkpoint (default `possession_f1`). `mcc` (Matthews correlation coefficient) uses all four confusion-matrix cells, so it is not inflated by the majority class; best checkpoints are then named `ppc_best_epochXXXX_mcc_YYYY.pt`.
