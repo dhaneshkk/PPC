@@ -20,6 +20,7 @@ from ppc.model import ModelConfig, PPC
 from ppc.pipeline import (
     PPC_CHECKPOINT_VERSION,
     PPC_MODEL_FAMILY,
+    _resolve_loss_weights,
     _run_epoch,
     _validate_checkpoint_payload,
 )
@@ -216,3 +217,13 @@ def test_analysis_scripts_reject_three_class_onnx(tmp_path: Path) -> None:
         script = _load_script(filename)
         with pytest.raises(ValueError, match="must contain 2 probabilities"):
             script._load_model(model_path)
+
+
+def test_loss_weights_not_doubled_with_weighted_sampler() -> None:
+    from types import SimpleNamespace
+
+    samples = [SimpleNamespace(label=0)] * 30 + [SimpleNamespace(label=1)] * 10
+    unweighted = _resolve_loss_weights(samples, uses_weighted_sampler=False)
+    assert torch.allclose(unweighted, torch.tensor([1.0, 3.0]))
+    with_sampler = _resolve_loss_weights(samples, uses_weighted_sampler=True)
+    assert torch.equal(with_sampler, torch.ones(2))
