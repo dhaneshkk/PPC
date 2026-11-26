@@ -484,7 +484,7 @@ class PPC(nn.Module):
                 self._head_variant = "avg"
         else:
             self._head_variant = head_variant
-        self._token_grid = self._ensure_token_grid(getattr(self.config, "token_mixer_grid", (3, 2)))
+        self._token_grid = self._ensure_token_grid(getattr(self.config, "token_mixer_grid", (2, 3)))
         self._token_layers = int(max(1, getattr(self.config, "token_mixer_layers", 2)))
 
         if variant == "baseline":
@@ -631,8 +631,8 @@ class PPC(nn.Module):
 
     def _ensure_token_grid(self, grid: Any) -> tuple[int, int]:
         if not isinstance(grid, (tuple, list)) or len(grid) != 2:
-            return (3, 2)
+            return (2, 3)
         h, w = int(grid[0]), int(grid[1])
         if h <= 0 or w <= 0:
-            return (3, 2)
+            return (2, 3)
         return (h, w)
