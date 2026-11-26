@@ -95,3 +95,25 @@ def test_train_predict_export_and_onnx_inference(tmp_path: Path) -> None:
     output = session.run(None, {input_name: np.zeros((1, 3, 48, 48), dtype=np.float32)})[0]
     assert output.shape == (1, 2)
     np.testing.assert_allclose(output.sum(axis=1), np.ones(1), atol=1e-5)
+
+
+def test_train_with_sam(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.parquet"
+    _write_tiny_dataset(dataset_path)
+    summary = train_pipeline(
+        TrainConfig(
+            data_root=dataset_path,
+            output_dir=tmp_path / "run",
+            epochs=2,
+            batch_size=4,
+            num_workers=0,
+            base_channels=4,
+            num_blocks=1,
+            dropout=0.0,
+            device="cpu",
+            sam_rho=0.05,
+        )
+    )
+    payload = torch.load(summary["checkpoint"], map_location="cpu", weights_only=False)
+    assert payload["train_config"]["sam_rho"] == 0.05
+    assert np.isfinite(summary["train_metrics"]["loss"])

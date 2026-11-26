@@ -10,7 +10,7 @@ import math
 import re
 import sys
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
@@ -407,6 +407,8 @@ class TrainConfig:
     device: str = "auto"
     resume_from: Optional[Path] = None
     use_amp: bool = False
+    sam_rho: float = 0.0
+    sam_adaptive: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -613,6 +615,55 @@ def _prune_checkpoints(directory: Path, prefix: str, max_keep: int) -> None:
             continue
 
 
+@torch.no_grad()
+def _sam_perturb(params: Sequence[torch.nn.Parameter], rho: float, adaptive: bool) -> List[Tuple[torch.nn.Parameter, torch.Tensor]]:
+    """Move parameters to the SAM ascent point w + e(w); return the offsets so they can be undone.
+
+    e(w) = rho * g / ||g||           (SAM, Foret et al. 2021)
+    e(w) = rho * w^2 * g / ||w * g|| (ASAM, Kwon et al. 2021)
+
+    Both are invariant to a global scaling of g, so AMP-scaled gradients can be used directly.
+    Non-finite or zero gradients (e.g. an AMP overflow step) produce no perturbation.
+    """
+
+    with_grad = [p for p in params if p.grad is not None]
+    if not with_grad:
+        return []
+    scaled = [(torch.abs(p) * p.grad) if adaptive else p.grad for p in with_grad]
+    grad_norm = torch.norm(torch.stack([g.detach().float().norm(2) for g in scaled]), 2)
+    if not torch.isfinite(grad_norm) or grad_norm.item() == 0.0:
+        return []
+    scale = rho / (grad_norm + 1e-12)
+    offsets: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
+    for p in with_grad:
+        e_w = (torch.pow(p, 2) if adaptive else 1.0) * p.grad * scale.to(p.grad.dtype)
+        p.add_(e_w)
+        offsets.append((p, e_w))
+    return offsets
+
+
+@torch.no_grad()
+def _sam_restore(offsets: Sequence[Tuple[torch.nn.Parameter, torch.Tensor]]) -> None:
+    for p, e_w in offsets:
+        p.sub_(e_w)
+
+
+@contextmanager
+def _frozen_bn_stats(model: nn.Module):
+    """Keep BatchNorm running statistics unchanged during SAM's second forward pass."""
+
+    saved = []
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            saved.append((module, module.momentum))
+            module.momentum = 0.0
+    try:
+        yield
+    finally:
+        for module, momentum in saved:
+            module.momentum = momentum
+
+
 def _run_epoch(
     model: nn.Module,
     dataloader: Optional[DataLoader],
@@ -624,6 +675,8 @@ def _run_epoch(
     progress_desc: Optional[str] = None,
     collect_outputs: bool = False,
     num_classes: int = NUM_CLASSES,
+    sam_rho: float = 0.0,
+    sam_adaptive: bool = False,
 ) -> Tuple[Dict[str, float], Optional[Dict[str, np.ndarray]]]:
     if num_classes != NUM_CLASSES:
         raise ValueError(f"PPC metrics require num_classes={NUM_CLASSES}, got {num_classes}.")
@@ -670,10 +723,26 @@ def _run_epoch(
         if train_mode:
             if scaler is not None:
                 scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            if sam_rho > 0:
+                # Sharpness-Aware Minimization: take the gradient at the worst-case point inside an
+                # L2 ball of radius rho, then apply it to the original weights.
+                params = [p for group in optimizer.param_groups for p in group["params"]]
+                offsets = _sam_perturb(params, sam_rho, sam_adaptive)
+                if offsets:
+                    optimizer.zero_grad(set_to_none=True)
+                    with _frozen_bn_stats(model), _autocast(autocast_enabled):
+                        sam_loss = criterion(model(images), labels)
+                    if scaler is not None:
+                        scaler.scale(sam_loss).backward()
+                    else:
+                        sam_loss.backward()
+                    _sam_restore(offsets)
+            if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 optimizer.step()
 
         batch_size = labels.size(0)
@@ -842,6 +911,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     LOGGER.info("Using device: %s", device)
     _set_seed(config.seed)
     amp_enabled = bool(config.use_amp and device.type == "cuda")
+    if config.sam_rho < 0:
+        raise ValueError("sam_rho must be >= 0.")
+    if config.sam_rho > 0:
+        LOGGER.info("Sharpness-Aware Minimization enabled (rho=%.4f, adaptive=%s).", config.sam_rho, config.sam_adaptive)
     if config.use_amp and not amp_enabled:
         LOGGER.warning("--use_amp requested but CUDA device is not available; proceeding without AMP.")
     tb_dir = config.output_dir
@@ -1078,6 +1151,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             progress_desc=f"Train {epoch}/{config.epochs}",
             collect_outputs=True,
             num_classes=NUM_CLASSES,
+            sam_rho=config.sam_rho,
+            sam_adaptive=config.sam_adaptive,
         )
         if val_loader:
             val_metrics, val_outputs = _run_epoch(
@@ -1824,6 +1899,18 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", type=str, default="auto")
     train_parser.add_argument("--resume", type=Path, help="Resume training from a checkpoint file.")
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (CUDA only).")
+    train_parser.add_argument(
+        "--sam_rho",
+        type=float,
+        default=0.0,
+        help="Enable Sharpness-Aware Minimization with this neighbourhood radius (e.g. 0.05; 0 disables). "
+        "Each step costs two forward/backward passes.",
+    )
+    train_parser.add_argument(
+        "--sam_adaptive",
+        action="store_true",
+        help="Use Adaptive SAM (ASAM): scale-invariant perturbation; typically pair with a larger --sam_rho (e.g. 0.5-2.0).",
+    )
     train_parser.add_argument("--verbose", action="store_true")
 
     predict_parser = subparsers.add_parser("predict", help="Run inference with a trained checkpoint.")
@@ -1933,6 +2020,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=args.device,
             resume_from=args.resume,
             use_amp=args.use_amp,
+            sam_rho=args.sam_rho,
+            sam_adaptive=args.sam_adaptive,
         )
         train_pipeline(config, verbose=args.verbose)
     elif args.command == "predict":
