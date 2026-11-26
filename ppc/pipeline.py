@@ -51,8 +51,12 @@ PPC_MODEL_FAMILY = "ppc"
 PPC_CHECKPOINT_VERSION = 1
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_DEIM_MODULE_PATH = _REPO_ROOT / "03_wholebody34_data_extractor.py"
-_DEFAULT_DETECTOR_MODEL = _REPO_ROOT / "deimv2_dinov3_x_wholebody34_680query_n_batch_640x640.onnx"
+# The whole-body detector wrapper lives in demo_ppc.py; it is loaded lazily so training does not need it.
+_DEIM_MODULE_PATH = _REPO_ROOT / "demo_ppc.py"
+_DEFAULT_DETECTOR_MODEL = _REPO_ROOT / "yolomit_t_wholebody28_1x3x480x640.onnx"
+# Must match demo_ppc.py: PPC is trained on hand crops, centre-expanded 2.5x around the hand box.
+HAND_CLASS_ID = 23
+DEFAULT_HAND_CROP_EXPANSION = 2.5
 _DEIM_MODULE: Optional[ModuleType] = None
 
 
@@ -122,11 +126,11 @@ def _load_deim_module() -> ModuleType:
         return _DEIM_MODULE
     if not _DEIM_MODULE_PATH.exists():
         raise FileNotFoundError(
-            f"DEIMv2 demo module not found at {_DEIM_MODULE_PATH}. Please ensure the script is available."
+            f"Detector wrapper module not found at {_DEIM_MODULE_PATH}. Please ensure demo_ppc.py is available."
         )
-    spec = importlib.util.spec_from_file_location("sc._deimv2_detector", _DEIM_MODULE_PATH)
+    spec = importlib.util.spec_from_file_location("ppc._demo_ppc_detector", _DEIM_MODULE_PATH)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load DEIMv2 demo module from {_DEIM_MODULE_PATH}.")
+        raise RuntimeError(f"Failed to load detector module from {_DEIM_MODULE_PATH}.")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -134,19 +138,19 @@ def _load_deim_module() -> ModuleType:
     return module
 
 
-def _create_mouth_detector(model_path: Path, providers: Sequence[Any]):
+def _create_hand_detector(model_path: Path, providers: Sequence[Any]):
     module = _load_deim_module()
     if not model_path.exists():
         raise FileNotFoundError(f"Detector model not found: {model_path}")
     provider_list = list(providers) if providers else ["CPUExecutionProvider"]
     try:
-        detector = module.DEIMv2(
+        detector = module.WholeBodyDetector(
             runtime="onnx",
             model_path=str(model_path),
             providers=provider_list,
         )
     except Exception as exc:  # pragma: no cover - defensive for runtime issues
-        raise RuntimeError(f"Failed to initialize DEIMv2 mouth detector: {exc}") from exc
+        raise RuntimeError(f"Failed to initialize whole-body hand detector: {exc}") from exc
     return detector
 
 
@@ -173,32 +177,95 @@ def _resolve_onnx_providers(provider: str) -> List[Any]:
             "CUDAExecutionProvider",
             'CPUExecutionProvider',
         ]
-        return ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        return providers
     return ["CPUExecutionProvider"]
 
 
-def _extract_mouth_crop(
+def _extract_expanded_crop(
     frame: np.ndarray,
     box: Any,
     *,
-    margin_top: int,
-    margin_bottom: int,
-    margin_left: int,
-    margin_right: int,
+    expansion: float,
 ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+    """Centre-expanded crop, identical to demo_ppc.crop_image_with_expansion.
+
+    Returns the crop and its (x1, y1, x2, y2) pixel coordinates (x2/y2 exclusive).
+    """
+
     if frame is None or frame.size == 0 or box is None:
         return None, None
-    h, w = frame.shape[:2]
-    x1 = max(int(box.x1) - margin_left, 0)
-    y1 = max(int(box.y1) - margin_top, 0)
-    x2 = min(int(box.x2) + margin_right, w - 1)
-    y2 = min(int(box.y2) + margin_bottom, h - 1)
+    if expansion <= 0:
+        raise ValueError("Expansion must be positive.")
+    frame_h, frame_w = frame.shape[:2]
+    box_w = float(box.x2 - box.x1)
+    box_h = float(box.y2 - box.y1)
+    if box_w <= 0 or box_h <= 0:
+        return None, None
+    cx = (float(box.x1) + float(box.x2)) / 2.0
+    cy = (float(box.y1) + float(box.y2)) / 2.0
+    half_w = box_w * expansion / 2.0
+    half_h = box_h * expansion / 2.0
+    x1 = max(0, min(frame_w, int(np.floor(cx - half_w))))
+    y1 = max(0, min(frame_h, int(np.floor(cy - half_h))))
+    x2 = max(0, min(frame_w, int(np.ceil(cx + half_w))))
+    y2 = max(0, min(frame_h, int(np.ceil(cy + half_h))))
     if x2 <= x1 or y2 <= y1:
         return None, None
-    crop = frame[y1 : y2 + 1, x1 : x2 + 1]
-    if crop.size == 0:
-        return None, None
-    return crop.copy(), (x1, y1, x2, y2)
+    return frame[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+
+
+def _detect_hand_crops(
+    detector: Any,
+    frame: np.ndarray,
+    *,
+    hand_class_id: int,
+    expansion: float,
+) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    boxes = detector(
+        image=frame,
+        disable_generation_identification_mode=True,
+        disable_gender_identification_mode=True,
+        disable_left_and_right_hand_identification_mode=True,
+        disable_headpose_identification_mode=True,
+    )
+    crops: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
+    for box in boxes:
+        if getattr(box, "classid", None) != hand_class_id:
+            continue
+        crop, coords = _extract_expanded_crop(frame, box, expansion=expansion)
+        if crop is not None and coords is not None:
+            crops.append((crop, coords))
+    return crops
+
+
+def _draw_hand_predictions(
+    frame: np.ndarray,
+    coords: Sequence[Tuple[int, int, int, int]],
+    probabilities: np.ndarray,
+) -> None:
+    if not coords:
+        cv2.putText(frame, "No hands detected", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+        return
+    for (x1, y1, x2, y2), probs in zip(coords, probabilities):
+        possession = float(probs[1])
+        pred_label = int(np.argmax(probs))
+        color = (0, 0, 255) if pred_label == 1 else (0, 200, 0)
+        cv2.rectangle(frame, (x1, y1), (x2 - 1, y2 - 1), color, 2)
+        cv2.putText(
+            frame,
+            f"{LABEL_MAP[pred_label]} {possession:.2f}",
+            (x1, max(16, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _crops_to_batch(crops: Sequence[np.ndarray], eval_transform: Any) -> torch.Tensor:
+    tensors = [eval_transform(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))) for crop in crops]
+    return torch.stack(tensors, dim=0)
 
 
 if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
@@ -1363,6 +1430,66 @@ def predict_images(
     return pd.DataFrame(records)
 
 
+def _open_detector(detector_model: Optional[Path], detector_provider: str):
+    detector_path = Path(detector_model) if detector_model is not None else _DEFAULT_DETECTOR_MODEL
+    if not detector_path.exists():
+        raise FileNotFoundError(
+            f"Detector model not found at {detector_path}. "
+            "Provide --detector_model pointing to a whole-body detector ONNX file "
+            "(the same one demo_ppc.py uses, e.g. yolomit_t_wholebody28_1x3x480x640.onnx)."
+        )
+    detector_providers = _resolve_onnx_providers(detector_provider)
+    detector = _create_hand_detector(detector_path, detector_providers)
+    LOGGER.info("Loaded whole-body detector from %s.", detector_path)
+    return detector
+
+
+def _webcam_loop(
+    *,
+    camera_index: int,
+    window_name: str,
+    mirror: bool,
+    detector: Any,
+    hand_class_id: int,
+    crop_expansion: float,
+    classify: Any,
+) -> None:
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open camera index {camera_index}.")
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                LOGGER.warning("Failed to read frame from camera; stopping.")
+                break
+            if mirror:
+                frame = cv2.flip(frame, 1)
+            try:
+                hand_crops = _detect_hand_crops(
+                    detector, frame, hand_class_id=hand_class_id, expansion=crop_expansion
+                )
+            except Exception as exc:  # pragma: no cover - runtime safeguard
+                LOGGER.error("Detector inference failed: %s", exc)
+                break
+            coords = [item[1] for item in hand_crops]
+            probabilities = (
+                classify([item[0] for item in hand_crops])
+                if hand_crops
+                else np.empty((0, NUM_CLASSES), dtype=np.float32)
+            )
+            _draw_hand_predictions(frame, coords, probabilities)
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                LOGGER.info("Exit requested (key press).")
+                break
+    finally:
+        cap.release()
+        cv2.destroyWindow(window_name)
+
+
 def run_webcam_inference(
     checkpoint_path: Path,
     camera_index: int = 0,
@@ -1371,6 +1498,8 @@ def run_webcam_inference(
     mirror: bool = False,
     detector_model: Optional[Path] = None,
     detector_provider: str = "cpu",
+    hand_class_id: int = HAND_CLASS_ID,
+    crop_expansion: float = DEFAULT_HAND_CROP_EXPANSION,
 ) -> None:
     device = _resolve_device(device_spec)
     checkpoint = _load_ppc_checkpoint(checkpoint_path, device)
@@ -1390,20 +1519,12 @@ def run_webcam_inference(
         LOGGER.warning("Invalid image_size %s in checkpoint; defaulting to 48x48.", image_size_raw)
         image_size = DEFAULT_IMAGE_SIZE
     _, eval_transform = _build_transforms(image_size, mean, std)
+    detector = _open_detector(detector_model, detector_provider)
 
-    detector_path = Path(detector_model) if detector_model is not None else _DEFAULT_DETECTOR_MODEL
-    if not detector_path.exists():
-        raise FileNotFoundError(
-            f"Detector model not found at {detector_path}. "
-            "Provide --detector_model pointing to a valid DEIMv2 ONNX file."
-        )
-    detector_providers = _resolve_onnx_providers(detector_provider)
-    mouth_detector = _create_mouth_detector(detector_path, detector_providers)
-    LOGGER.info("Loaded DEIMv2 detector from %s using providers %s.", detector_path, detector_providers)
-
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open camera index {camera_index}.")
+    @torch.no_grad()
+    def classify(crops: Sequence[np.ndarray]) -> np.ndarray:
+        batch = _crops_to_batch(crops, eval_transform).to(device)
+        return torch.softmax(model(batch), dim=1).cpu().numpy()
 
     LOGGER.info(
         "Starting webcam inference using checkpoint %s on device %s (camera index %d).",
@@ -1411,107 +1532,15 @@ def run_webcam_inference(
         device,
         camera_index,
     )
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-    margin_top = 2
-    margin_bottom = 6
-    margin_left = 2
-    margin_right = 2
-
-    try:
-        with torch.no_grad():
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    LOGGER.warning("Failed to read frame from camera; stopping.")
-                    break
-
-                if mirror:
-                    frame = cv2.flip(frame, 1)
-
-                try:
-                    boxes = mouth_detector(
-                        image=frame,
-                        disable_generation_identification_mode=True,
-                        disable_gender_identification_mode=True,
-                        disable_left_and_right_hand_identification_mode=True,
-                        disable_headpose_identification_mode=True,
-                    )
-                except Exception as exc:  # pragma: no cover - runtime safeguard
-                    LOGGER.error("Detector inference failed: %s", exc)
-                    break
-
-                mouth_boxes = [box for box in boxes if getattr(box, "classid", None) == 19]
-                best_box = max(mouth_boxes, key=lambda box: box.score) if mouth_boxes else None
-                crop, crop_coords = _extract_mouth_crop(
-                    frame,
-                    best_box,
-                    margin_top=margin_top,
-                    margin_bottom=margin_bottom,
-                    margin_left=margin_left,
-                    margin_right=margin_right,
-                )
-
-                if crop is None:
-                    cv2.putText(
-                        frame,
-                        "Region not detected",
-                        (12, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.imshow(window_name, frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), 27):
-                        LOGGER.info("Exit requested (key press).")
-                        break
-                    continue
-
-                rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                pil_crop = Image.fromarray(rgb_crop)
-                tensor = eval_transform(pil_crop).unsqueeze(0).to(device)
-                logits = model(tensor)
-                probs = torch.softmax(logits, dim=1)[0]
-                pred_label = int(torch.argmax(probs).item())
-                confidence = float(probs[pred_label].item())
-                label = LABEL_MAP.get(pred_label, str(pred_label))
-                color = (0, 200, 0)
-                cv2.putText(
-                    frame,
-                    f"Prediction: {label}",
-                    (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame,
-                    f"Confidence: {confidence:.2%}",
-                    (12, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
-
-                if crop_coords is not None:
-                    x1, y1, x2, y2 = crop_coords
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-                cv2.imshow(window_name, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
-                    LOGGER.info("Exit requested (key press).")
-                    break
-    finally:
-        cap.release()
-        cv2.destroyWindow(window_name)
+    _webcam_loop(
+        camera_index=camera_index,
+        window_name=window_name,
+        mirror=mirror,
+        detector=detector,
+        hand_class_id=hand_class_id,
+        crop_expansion=crop_expansion,
+        classify=classify,
+    )
 
 
 def run_webcam_inference_onnx(
@@ -1523,6 +1552,8 @@ def run_webcam_inference_onnx(
     detector_model: Optional[Path] = None,
     detector_provider: str = "cpu",
     image_size: Optional[tuple[int, int]] = None,
+    hand_class_id: int = HAND_CLASS_ID,
+    crop_expansion: float = DEFAULT_HAND_CROP_EXPANSION,
 ) -> None:
     try:
         import onnxruntime as ort  # type: ignore
@@ -1563,132 +1594,33 @@ def run_webcam_inference_onnx(
             )
             height, width = DEFAULT_IMAGE_SIZE
     _, eval_transform = _build_transforms((height, width), DEFAULT_MEAN, DEFAULT_STD)
+    detector = _open_detector(detector_model, detector_provider)
+    batch_is_static = len(input_shape) >= 1 and isinstance(input_shape[0], int)
 
-    detector_path = Path(detector_model) if detector_model is not None else _DEFAULT_DETECTOR_MODEL
-    if not detector_path.exists():
-        raise FileNotFoundError(
-            f"Detector model not found at {detector_path}. "
-            "Provide --detector_model pointing to a valid DEIMv2 ONNX file."
-        )
-    detector_providers = _resolve_onnx_providers(detector_provider)
-    mouth_detector = _create_mouth_detector(detector_path, detector_providers)
+    def classify(crops: Sequence[np.ndarray]) -> np.ndarray:
+        batch = _crops_to_batch(crops, eval_transform).cpu().numpy()
+        if batch_is_static:
+            outputs = [session.run([output_name], {input_name: batch[i : i + 1]})[0] for i in range(len(batch))]
+        else:
+            outputs = [session.run([output_name], {input_name: batch})[0]]
+        probs = np.concatenate([np.asarray(out).reshape(-1, NUM_CLASSES) for out in outputs], axis=0)
+        return np.stack([_validate_probability_output(row, f"ONNX model {onnx_model}") for row in probs])
+
     LOGGER.info(
-        "Loaded ONNX model %s with providers %s (detector providers %s).",
+        "Starting ONNX webcam inference using %s with providers %s (camera index %d).",
         onnx_model,
         providers,
-        detector_providers,
-    )
-
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open camera index {camera_index}.")
-
-    LOGGER.info(
-        "Starting ONNX webcam inference using %s (camera index %d).",
-        onnx_model,
         camera_index,
     )
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-    margin_top = 5 #2
-    margin_bottom = 5 #6
-    margin_left = 5 #2
-    margin_right = 5 #2
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                LOGGER.warning("Failed to read frame from camera; stopping.")
-                break
-
-            if mirror:
-                frame = cv2.flip(frame, 1)
-
-            try:
-                boxes = mouth_detector(
-                    image=frame,
-                    disable_generation_identification_mode=True,
-                    disable_gender_identification_mode=True,
-                    disable_left_and_right_hand_identification_mode=True,
-                    disable_headpose_identification_mode=True,
-                )
-            except Exception as exc:  # pragma: no cover - runtime safeguard
-                LOGGER.error("Detector inference failed: %s", exc)
-                break
-
-            mouth_boxes = [box for box in boxes if getattr(box, "classid", None) == 19]
-            best_box = max(mouth_boxes, key=lambda box: box.score) if mouth_boxes else None
-            crop, crop_coords = _extract_mouth_crop(
-                frame,
-                best_box,
-                margin_top=margin_top,
-                margin_bottom=margin_bottom,
-                margin_left=margin_left,
-                margin_right=margin_right,
-            )
-
-            if crop is None:
-                cv2.putText(
-                    frame,
-                    "Region not detected",
-                    (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.imshow(window_name, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
-                    LOGGER.info("Exit requested (key press).")
-                    break
-                continue
-
-            rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            pil_crop = Image.fromarray(rgb_crop)
-            tensor = eval_transform(pil_crop).unsqueeze(0)
-            inputs = {input_name: tensor.cpu().numpy()}
-            outputs = session.run([output_name], inputs)
-            probs = _validate_probability_output(outputs[0], f"ONNX model {onnx_model}")
-            pred_label = int(np.argmax(probs))
-            confidence = float(probs[pred_label])
-            label = LABEL_MAP.get(pred_label, str(pred_label))
-            color = (0, 200, 0)
-            cv2.putText(
-                frame,
-                f"Prediction: {label}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame,
-                f"Confidence: {confidence:.2%}",
-                (12, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-
-            if crop_coords is not None:
-                x1, y1, x2, y2 = crop_coords
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            cv2.imshow(window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                LOGGER.info("Exit requested (key press).")
-                break
-    finally:
-        cap.release()
-        cv2.destroyWindow(window_name)
+    _webcam_loop(
+        camera_index=camera_index,
+        window_name=window_name,
+        mirror=mirror,
+        detector=detector,
+        hand_class_id=hand_class_id,
+        crop_expansion=crop_expansion,
+        classify=classify,
+    )
 
 
 def export_to_onnx(
@@ -1856,7 +1788,7 @@ def build_parser() -> argparse.ArgumentParser:
     webcam_parser.add_argument(
         "--detector_model",
         type=Path,
-        help="Optional path to the DEIMv2 ONNX model for region detection. Defaults to the bundled weight.",
+        help="Whole-body detector ONNX used to find hands (default: yolomit_t_wholebody28_1x3x480x640.onnx in the repo root).",
     )
     webcam_parser.add_argument(
         "--detector_provider",
@@ -1864,6 +1796,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="cpu",
         choices=["cpu", "cuda", "tensorrt"],
         help="ONNX Runtime execution provider for the detector (default: cpu).",
+    )
+
+    webcam_parser.add_argument(
+        "--hand_class_id",
+        type=int,
+        default=HAND_CLASS_ID,
+        help=f"Detector class id treated as a hand (default: {HAND_CLASS_ID}, as in demo_ppc.py).",
+    )
+    webcam_parser.add_argument(
+        "--crop_expansion",
+        type=float,
+        default=DEFAULT_HAND_CROP_EXPANSION,
+        help=f"Centre expansion applied to each hand box before classification (default: {DEFAULT_HAND_CROP_EXPANSION}).",
     )
 
     webcam_onnx_parser = subparsers.add_parser("webcam_onnx", help="Run real-time inference from a webcam using an ONNX model.")
@@ -1881,7 +1826,7 @@ def build_parser() -> argparse.ArgumentParser:
     webcam_onnx_parser.add_argument(
         "--detector_model",
         type=Path,
-        help="Optional path to the DEIMv2 ONNX model for region detection. Defaults to the bundled weight.",
+        help="Whole-body detector ONNX used to find hands (default: yolomit_t_wholebody28_1x3x480x640.onnx in the repo root).",
     )
     webcam_onnx_parser.add_argument(
         "--detector_provider",
@@ -1895,6 +1840,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Override classifier input size as HEIGHTxWIDTH (defaults to ONNX model shape).",
+    )
+
+    webcam_onnx_parser.add_argument(
+        "--hand_class_id",
+        type=int,
+        default=HAND_CLASS_ID,
+        help=f"Detector class id treated as a hand (default: {HAND_CLASS_ID}, as in demo_ppc.py).",
+    )
+    webcam_onnx_parser.add_argument(
+        "--crop_expansion",
+        type=float,
+        default=DEFAULT_HAND_CROP_EXPANSION,
+        help=f"Centre expansion applied to each hand box before classification (default: {DEFAULT_HAND_CROP_EXPANSION}).",
     )
 
     onnx_parser = subparsers.add_parser("exportonnx", help="Export a trained checkpoint to ONNX.")
@@ -1966,6 +1924,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             mirror=args.mirror,
             detector_model=args.detector_model,
             detector_provider=args.detector_provider,
+            hand_class_id=args.hand_class_id,
+            crop_expansion=args.crop_expansion,
         )
     elif args.command == "webcam_onnx":
         parsed_size = _parse_image_size_arg(args.image_size) if args.image_size else None
@@ -1978,6 +1938,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             detector_model=args.detector_model,
             detector_provider=args.detector_provider,
             image_size=parsed_size,
+            hand_class_id=args.hand_class_id,
+            crop_expansion=args.crop_expansion,
         )
     elif args.command == "exportonnx":
         export_to_onnx(args.checkpoint, args.output, opset=args.opset, device_spec=args.device)
