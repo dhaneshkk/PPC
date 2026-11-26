@@ -63,6 +63,20 @@ train and validation sets using a seeded 90/10 split.
 uv run python 02_make_parquet.py
 ```
 
+The split is made per **group**, not per image (`--split-by source`, the default). A group is the
+sub-directory under the label folder (e.g. `data/possession/clip_012/`), so consecutive frames from the
+same video never end up on both sides of the split. If your frames sit in one flat folder, derive the group
+from the filename with `--group-regex`; the first capture group is the group key:
+
+```bash
+# clipA_000123.png, clipA_000124.png, clipB_000001.png ... -> groups clipA, clipB
+uv run python 02_make_parquet.py --group-regex '^(.*?)_\d+\.png$' --overwrite
+```
+
+If a class has only one group the script warns and falls back to the legacy per-image split.
+`--split-by image` forces the legacy behaviour. Each row records its `split_group`, and the summary
+reports how many groups are in each split and whether any group is shared.
+
 To store image paths without embedding image bytes, run:
 
 ```bash
