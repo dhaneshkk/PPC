@@ -7,7 +7,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from ppc.pipeline import _run_epoch, _sam_perturb, _sam_restore
+from pathlib import Path
+
+import numpy as np
+
+from ppc.pipeline import TrainConfig, _run_epoch, _sam_perturb, _sam_restore, train_pipeline
+from test_ppc_integration import _write_tiny_dataset
 
 
 class _DictLoader(TensorDataset):
@@ -93,3 +98,25 @@ def test_sam_updates_batchnorm_statistics_once_per_step() -> None:
     torch.testing.assert_close(sam[1].running_var, plain[1].running_var)
     assert int(sam[1].num_batches_tracked) == int(plain[1].num_batches_tracked) + 1  # counter only
     assert sam[1].momentum == plain[1].momentum
+
+
+def test_train_with_sam(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.parquet"
+    _write_tiny_dataset(dataset_path)
+    summary = train_pipeline(
+        TrainConfig(
+            data_root=dataset_path,
+            output_dir=tmp_path / "run",
+            epochs=2,
+            batch_size=4,
+            num_workers=0,
+            base_channels=4,
+            num_blocks=1,
+            dropout=0.0,
+            device="cpu",
+            sam_rho=0.05,
+        )
+    )
+    payload = torch.load(summary["checkpoint"], map_location="cpu", weights_only=False)
+    assert payload["train_config"]["sam_rho"] == 0.05
+    assert np.isfinite(summary["train_metrics"]["loss"])
