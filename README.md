@@ -14,7 +14,7 @@ The PyTorch model and exported ONNX model always return two probabilities in the
 
 https://github.com/user-attachments/assets/715f87c7-e1ed-4849-b838-377bb010a99f
 
-  |Variant|Size|F1|CPU<br>inference<br>latency|ONNX|
+  |Variant|Size|F1 (`possession`, val)|CPU<br>inference<br>latency|ONNX|
   |:-:|:-:|:-:|:-:|:-:|
   |P|115 KB|0.8959| 0.24 ms|[Download](https://github.com/PINTO0309/PPC/releases/download/onnx/ppc_p_48x48.onnx)|
   |N|176 KB|0.9386| 0.39 ms|[Download](https://github.com/PINTO0309/PPC/releases/download/onnx/ppc_n_48x48.onnx)|
@@ -121,11 +121,11 @@ uv run python demo_phone_gaze_classification.py \
 
 ## Training Pipeline
 
-- Use the labeled image folders under `data/no_action`, `data/point_somewhere`, and `data/point`.
-- `02_make_parquet.py` writes pre-defined train/val splits into `data/dataset.parquet` using an image-level 9:1 split per class.
-- The training loop relies on `BCEWithLogitsLoss` plus class-balanced `pos_weight` to stabilise optimisation under class imbalance; inference produces sigmoid probabilities. Use `--train_resampling weighted` to switch on the previous `WeightedRandomSampler` behaviour, or `--train_resampling balanced` to physically duplicate minority classes before shuffling.
+- Use the labeled image folders under `data/no_possession` and `data/possession` (only the top-level label directory decides the class).
+- `02_make_parquet.py` writes pre-defined train/val splits into `data/dataset.parquet` using a seeded 9:1 split per class. The training script uses those splits as-is; `--train_ratio`/`--val_ratio`/`--test_ratio` on `ppc train` are informational only.
+- The model outputs two logits and is trained with `CrossEntropyLoss` using class weights `max_count / class_count` computed from the training samples; inference applies softmax, giving `[no_possession, possession]` probabilities that sum to 1. `--train_resampling none` (default) relies on those loss weights alone, `--train_resampling weighted` uses a `WeightedRandomSampler`, and `--train_resampling balanced` physically duplicates minority-class samples before shuffling (the loss weights then become ~1).
 - Training history, validation metrics, optional test predictions, checkpoints, configuration JSON, and ONNX exports are produced automatically.
-- Per-epoch checkpoints named like `ppc_epoch_0001.pt` are retained (latest 10), as well as the best checkpoints named `ppc_best_epoch0004_f1_0.9321.pt` (also latest 10).
+- Per-epoch checkpoints named like `ppc_epoch_0001.pt` are retained (latest 10), as well as the best checkpoints named `ppc_best_epoch0004_possession_f1_0.9321.pt` (also latest 10). "Best" means the highest validation F1 of the `possession` class.
 - The backbone can be switched with `--arch_variant`. Supported combinations with `--head_variant` are:
 
   | `--arch_variant` | Default (`--head_variant auto`) | Explicitly selectable heads | Remarks |
@@ -202,7 +202,7 @@ uv run python -m ppc train \
 --use_amp
 ```
 
-- Outputs include the latest 10 `ppc_epoch_*.pt`, the latest 10 `ppc_best_epochXXXX_f1_YYYY.pt` (highest validation F1, or training F1 when no validation split), `history.json`, `summary.json`, optional `test_predictions.csv`, and `train.log`.
+- Outputs include the latest 10 `ppc_epoch_*.pt`, the latest 10 `ppc_best_epochXXXX_possession_f1_YYYY.pt` (highest validation `possession` F1, or training F1 when no validation split), `history.json`, `summary.json`, optional `test_predictions.csv`, and `train.log`.
 - After every epoch a confusion matrix and ROC curve are saved under `runs/ppc/diagnostics/<split>/confusion_<split>_epochXXXX.png` and `roc_<split>_epochXXXX.png`.
 - `--image_size` accepts either a single integer for square crops (e.g. `--image_size 48`) or `HEIGHTxWIDTH` to resize non-square frames (e.g. `--image_size 64x48`).
 - Add `--resume <checkpoint>` to continue from an earlier epoch. Remember that `--epochs` indicates the desired total epoch count (e.g. resuming `--epochs 40` after training to epoch 30 will run 10 additional epochs).
@@ -215,12 +215,12 @@ uv run python -m ppc train \
 
 ```bash
 uv run python -m ppc exportonnx \
---checkpoint runs/ppc_is_s_48x48/ppc_best_epoch0049_f1_0.9939.pt \
+--checkpoint runs/ppc_is_s_48x48/ppc_best_epoch0049_possession_f1_0.9939.pt \
 --output ppc_s_48x48.onnx \
 --opset 17
 ```
 
-- The saved graph exposes `images` as input and `prob_pointing` as output (batch dimension is dynamic); probabilities can be consumed directly.
+- The saved graph exposes `images` (`[N, 3, H, W]`, RGB, float in `[0, 1]`, no mean/std normalisation) as input and `probabilities` (`[N, 2]`, softmax over `[no_possession, possession]`) as output. The batch dimension is dynamic.
 - After exporting, the tool runs `onnxsim` for simplification and rewrites any remaining BatchNormalization nodes into affine `Mul`/`Add` primitives. If simplification fails, a warning is emitted and the unsimplified model is preserved.
 
 ## Arch
@@ -248,7 +248,7 @@ interact with smartphones](https://github.com/PINTO0309/PUC) - MIT License
 If you find this project useful, please consider citing:
 
 ```bibtex
-@software{hyodo2025ppc,
+@software{hyodo2026ppc,
   author    = {Katsuya Hyodo},
   title     = {PINTO0309/PPC},
   month     = {07},
