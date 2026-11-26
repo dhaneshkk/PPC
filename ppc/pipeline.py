@@ -453,6 +453,7 @@ class TrainConfig:
     epochs: int = 30
     batch_size: int = 32
     train_resampling: str = "none"
+    select_metric: str = "possession_f1"
     lr: float = 1e-4
     weight_decay: float = 1e-4
     num_workers: int = 8
@@ -683,6 +684,22 @@ def _infer_accuracy(train_metrics: Dict[str, float], val_metrics: Optional[Dict[
     return float(train_metrics.get("accuracy", 0.0))
 
 
+SELECTABLE_METRICS = ("possession_f1", "mcc", "macro_f1")
+
+
+def _binary_mcc(confusion: np.ndarray) -> float:
+    """Matthews correlation coefficient for a 2x2 confusion matrix (rows=true, cols=pred).
+
+    Returns 0.0 when any marginal is zero (the usual convention: no correlation measurable).
+    """
+
+    tn, fp, fn, tp = (float(v) for v in np.asarray(confusion, dtype=np.float64).reshape(-1)[:4])
+    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    if denom <= 0.0:
+        return 0.0
+    return (tp * tn - fp * fn) / math.sqrt(denom)
+
+
 def _prune_checkpoints(directory: Path, prefix: str, max_keep: int) -> None:
     checkpoints = sorted(directory.glob(f"{prefix}*.pt"))
     if len(checkpoints) <= max_keep:
@@ -718,6 +735,7 @@ def _run_epoch(
             "macro_precision": float("nan"),
             "macro_recall": float("nan"),
             "macro_f1": float("nan"),
+            "mcc": float("nan"),
         }
         return empty_metrics, None
 
@@ -810,6 +828,7 @@ def _run_epoch(
         "macro_precision": float(np.mean(precision_per_class)),
         "macro_recall": float(np.mean(recall_per_class)),
         "macro_f1": float(np.mean(f1_per_class)),
+        "mcc": _binary_mcc(confusion),
     }
     extras = None
     if collect_outputs:
@@ -915,6 +934,9 @@ def _evaluate_predictions(model: nn.Module, dataloader: DataLoader, device: torc
 
 def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]:
     _setup_logging(config.output_dir, verbose=verbose)
+    select_metric = config.select_metric
+    if select_metric not in SELECTABLE_METRICS:
+        raise ValueError(f"select_metric must be one of {SELECTABLE_METRICS}, got {select_metric!r}.")
     config_dict = config.to_dict()
     train_config_serialized = copy.deepcopy(config_dict)
     LOGGER.info("Starting training with config: %s", json.dumps(config_dict, indent=2))
@@ -1051,7 +1073,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
     start_epoch = 1
     best_state: Optional[Dict[str, Any]] = None
     best_val_loss = math.inf
-    best_possession_f1 = float("-inf")
+    best_score = float("-inf")
     best_checkpoint_path: Optional[Path] = None
 
     if config.resume_from:
@@ -1105,9 +1127,12 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 resume_train_metrics,
                 resume_val_metrics if isinstance(resume_val_metrics, dict) else None,
             )
-        best_possession_f1_candidate = resume_payload.get("best_possession_f1")
+        if resume_payload.get("best_select_metric", "possession_f1") == select_metric:
+            best_possession_f1_candidate = resume_payload.get("best_score", resume_payload.get("best_possession_f1"))
+        else:
+            best_possession_f1_candidate = None
         if best_possession_f1_candidate is not None:
-            best_possession_f1 = float(best_possession_f1_candidate)
+            best_score = float(best_possession_f1_candidate)
         else:
             candidate_sources = [
                 resume_val_metrics if isinstance(resume_val_metrics, dict) else None,
@@ -1115,13 +1140,13 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             ]
             extracted_f1 = None
             for source in candidate_sources:
-                if source and source.get("possession_f1") is not None and not math.isnan(source.get("possession_f1")):
-                    extracted_f1 = float(source["possession_f1"])
+                if source and source.get(select_metric) is not None and not math.isnan(source.get(select_metric)):
+                    extracted_f1 = float(source[select_metric])
                     break
             if extracted_f1 is not None:
-                best_possession_f1 = extracted_f1
+                best_score = extracted_f1
             else:
-                best_possession_f1 = float("-inf")
+                best_score = float("-inf")
 
         best_state = {
             "epoch": resume_payload.get("best_epoch", resume_epoch),
@@ -1133,7 +1158,9 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             "val_metrics": resume_val_metrics,
             "best_val_loss": best_val_loss,
             "best_accuracy": best_accuracy,
-            "best_possession_f1": best_possession_f1,
+            "best_possession_f1": resume_payload.get("best_possession_f1", best_score),
+            "best_select_metric": select_metric,
+            "best_score": best_score,
             "checkpoint_path": str(resume_path),
         }
         best_checkpoint_path = resume_path
@@ -1194,6 +1221,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 "macro_precision": float("nan"),
                 "macro_recall": float("nan"),
                 "macro_f1": float("nan"),
+                "mcc": float("nan"),
             },
             "lr": optimizer.param_groups[0]["lr"],
         }
@@ -1205,7 +1233,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
             f"pos_prec {train_metrics['possession_precision']:.4f} "
             f"pos_rec {train_metrics['possession_recall']:.4f} "
             f"pos_f1 {train_metrics['possession_f1']:.4f} "
-            f"macro_f1 {train_metrics['macro_f1']:.4f}"
+            f"macro_f1 {train_metrics['macro_f1']:.4f} "
+            f"mcc {train_metrics['mcc']:.4f}"
         )
         if val_metrics:
             val_summary = (
@@ -1214,10 +1243,11 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 f"pos_prec {val_metrics['possession_precision']:.4f} "
                 f"pos_rec {val_metrics['possession_recall']:.4f} "
                 f"pos_f1 {val_metrics['possession_f1']:.4f} "
-                f"macro_f1 {val_metrics['macro_f1']:.4f}"
+                f"macro_f1 {val_metrics['macro_f1']:.4f} "
+                f"mcc {val_metrics['mcc']:.4f}"
             )
         else:
-            val_summary = "loss n/a acc n/a pos_prec n/a pos_rec n/a pos_f1 n/a macro_f1 n/a"
+            val_summary = "loss n/a acc n/a pos_prec n/a pos_rec n/a pos_f1 n/a macro_f1 n/a mcc n/a"
 
         LOGGER.info("Epoch %d | train %s | val %s", epoch, train_summary, val_summary)
 
@@ -1225,11 +1255,13 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         tb_writer.add_scalar("metrics/train_accuracy", train_metrics["accuracy"], epoch)
         tb_writer.add_scalar("metrics/train_possession_f1", train_metrics["possession_f1"], epoch)
         tb_writer.add_scalar("metrics/train_macro_f1", train_metrics["macro_f1"], epoch)
+        tb_writer.add_scalar("metrics/train_mcc", train_metrics["mcc"], epoch)
         if val_metrics is not None:
             tb_writer.add_scalar("loss/val", val_metrics["loss"], epoch)
             tb_writer.add_scalar("metrics/val_accuracy", val_metrics["accuracy"], epoch)
             tb_writer.add_scalar("metrics/val_possession_f1", val_metrics["possession_f1"], epoch)
             tb_writer.add_scalar("metrics/val_macro_f1", val_metrics["macro_f1"], epoch)
+            tb_writer.add_scalar("metrics/val_mcc", val_metrics["mcc"], epoch)
         tb_writer.flush()
 
         if train_outputs is not None:
@@ -1258,10 +1290,10 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         _prune_checkpoints(config.output_dir, "ppc_epoch_", 10)
 
         current_val_loss = val_metrics["loss"] if val_metrics else train_metrics["loss"]
-        score_value = val_metrics["possession_f1"] if val_metrics else train_metrics["possession_f1"]
-        if score_value > best_possession_f1:
+        score_value = val_metrics[select_metric] if val_metrics else train_metrics[select_metric]
+        if score_value > best_score:
             accuracy_value = _infer_accuracy(train_metrics, val_metrics)
-            best_possession_f1 = score_value
+            best_score = score_value
             best_val_loss = current_val_loss
             best_state = {
                 "epoch": epoch,
@@ -1273,22 +1305,26 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
                 "val_metrics": copy.deepcopy(val_metrics) if val_metrics is not None else None,
                 "best_val_loss": current_val_loss,
                 "best_accuracy": accuracy_value,
-                "best_possession_f1": score_value,
+                "best_possession_f1": (val_metrics or train_metrics)["possession_f1"],
+                "best_select_metric": select_metric,
+                "best_score": score_value,
             }
             best_checkpoint = dict(epoch_payload)
             best_checkpoint.update(
                 best_val_loss=current_val_loss,
                 best_epoch=epoch,
                 best_accuracy=accuracy_value,
-                best_possession_f1=score_value,
+                best_possession_f1=(val_metrics or train_metrics)["possession_f1"],
+                best_select_metric=select_metric,
+                best_score=score_value,
             )
             best_checkpoint_path = (
-                config.output_dir / f"ppc_best_epoch{epoch:04d}_possession_f1_{score_value:.4f}.pt"
+                config.output_dir / f"ppc_best_epoch{epoch:04d}_{select_metric}_{score_value:.4f}.pt"
             )
             best_state["checkpoint_path"] = str(best_checkpoint_path)
             torch.save(best_checkpoint, best_checkpoint_path)
             _prune_checkpoints(config.output_dir, "ppc_best_", 10)
-            LOGGER.info("New best model at epoch %d (possession F1 %.4f).", epoch, score_value)
+            LOGGER.info("New best model at epoch %d (%s %.4f).", epoch, select_metric, score_value)
 
     if best_state is None or best_checkpoint_path is None:
         raise RuntimeError("Training did not produce a valid model checkpoint.")
@@ -1315,6 +1351,7 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         tb_writer.add_scalar("metrics/test_accuracy", test_metrics["accuracy"], step)
         tb_writer.add_scalar("metrics/test_possession_f1", test_metrics["possession_f1"], step)
         tb_writer.add_scalar("metrics/test_macro_f1", test_metrics["macro_f1"], step)
+        tb_writer.add_scalar("metrics/test_mcc", test_metrics["mcc"], step)
         tb_writer.flush()
 
     with open(config.output_dir / "history.json", "w", encoding="utf-8") as fp:
@@ -1345,6 +1382,8 @@ def train_pipeline(config: TrainConfig, verbose: bool = False) -> Dict[str, Any]
         "best_epoch": best_state["epoch"],
         "best_accuracy": best_state["best_accuracy"],
         "best_possession_f1": best_state["best_possession_f1"],
+        "best_select_metric": best_state.get("best_select_metric", select_metric),
+        "best_score": best_state.get("best_score", best_state["best_possession_f1"]),
         "best_val_loss": best_state["best_val_loss"],
         "val_metrics": best_state["val_metrics"],
         "train_metrics": best_state["train_metrics"],
@@ -1724,6 +1763,13 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--val_ratio", type=float, default=0.2)
     train_parser.add_argument("--test_ratio", type=float, default=0.0)
     train_parser.add_argument("--seed", type=int, default=42)
+    train_parser.add_argument(
+        "--select_metric",
+        choices=SELECTABLE_METRICS,
+        default="possession_f1",
+        help="Validation metric used to pick the best checkpoint (default: possession_f1). "
+        "'mcc' (Matthews correlation) uses all four confusion-matrix cells and is robust to class imbalance.",
+    )
     train_parser.add_argument("--base_channels", type=int, default=32)
     train_parser.add_argument("--num_blocks", type=int, default=4)
     train_parser.add_argument("--dropout", type=float, default=0.3)
@@ -1893,6 +1939,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
             seed=args.seed,
+            select_metric=args.select_metric,
             base_channels=args.base_channels,
             num_blocks=args.num_blocks,
             dropout=args.dropout,

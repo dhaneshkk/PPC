@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from ppc.data import CLASS_ID_TO_NAME, NUM_CLASSES, _to_label
 from ppc.model import ModelConfig, PPC
 from ppc.pipeline import (
+    _binary_mcc,
     PPC_CHECKPOINT_VERSION,
     PPC_MODEL_FAMILY,
     _resolve_loss_weights,
@@ -218,6 +219,22 @@ def test_metrics_report_possession_and_macro_values() -> None:
     assert metrics["possession_recall"] == pytest.approx(1 / 2)
     assert metrics["possession_f1"] == pytest.approx(0.4)
     assert metrics["macro_f1"] == pytest.approx((16 / 19 + 0.4) / 2)
+    # TN=8, FP=2, FN=1, TP=1 -> (1*8 - 2*1) / sqrt(3*2*10*9)
+    assert metrics["mcc"] == pytest.approx(6 / 540 ** 0.5)
+
+
+@pytest.mark.parametrize(
+    ("confusion", "expected"),
+    [
+        ([[5, 0], [0, 5]], 1.0),
+        ([[0, 5], [5, 0]], -1.0),
+        ([[10, 0], [3, 0]], 0.0),  # never predicts possession -> undefined, reported as 0
+        ([[0, 0], [0, 0]], 0.0),
+        ([[8, 2], [1, 1]], 6 / 540 ** 0.5),
+    ],
+)
+def test_binary_mcc(confusion, expected) -> None:
+    assert _binary_mcc(np.array(confusion)) == pytest.approx(expected)
 
 
 def test_checkpoint_contract_rejects_legacy_puc(tmp_path: Path) -> None:
