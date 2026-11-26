@@ -118,6 +118,67 @@ def test_make_parquet_uses_folder_labels_and_reproducible_split(tmp_path: Path) 
         script.validate_ppc_dataframe(legacy)
 
 
+def test_make_parquet_source_split_keeps_groups_disjoint(tmp_path: Path) -> None:
+    script = _load_script("02_make_parquet.py")
+    data_dir = tmp_path / "data"
+    for label, color in (("no_possession", (0, 0, 0)), ("possession", (255, 255, 255))):
+        for clip in range(5):
+            clip_dir = data_dir / label / f"clip_{clip:02d}"
+            clip_dir.mkdir(parents=True)
+            for index in range(4):
+                Image.new("RGB", (48, 48), color=color).save(clip_dir / f"frame_{index:03d}.png")
+
+    args = argparse.Namespace(
+        data_dir=data_dir,
+        output=tmp_path / "dataset.parquet",
+        train_ratio=0.8,
+        val_ratio=0.2,
+        seed=7,
+        no_embed_images=True,
+        split_by="source",
+        group_regex=None,
+    )
+    df = script.build_dataset(args)
+    train_groups = set(df.loc[df["split"] == "train", "split_group"])
+    val_groups = set(df.loc[df["split"] == "val", "split_group"])
+    assert val_groups, "expected at least one validation group"
+    assert not (train_groups & val_groups)
+    assert df.groupby(["label", "split"]).size().to_dict() == {
+        ("no_possession", "train"): 16,
+        ("no_possession", "val"): 4,
+        ("possession", "train"): 16,
+        ("possession", "val"): 4,
+    }
+    pd.testing.assert_frame_equal(df, script.build_dataset(args))
+
+
+def test_make_parquet_group_regex_groups_flat_frames(tmp_path: Path) -> None:
+    script = _load_script("02_make_parquet.py")
+    data_dir = tmp_path / "data"
+    for label, color in (("no_possession", (0, 0, 0)), ("possession", (255, 255, 255))):
+        label_dir = data_dir / label
+        label_dir.mkdir(parents=True)
+        for clip in ("a", "b", "c", "d"):
+            for index in range(5):
+                Image.new("RGB", (48, 48), color=color).save(label_dir / f"{clip}_{index:06d}.png")
+
+    args = argparse.Namespace(
+        data_dir=data_dir,
+        output=tmp_path / "dataset.parquet",
+        train_ratio=0.75,
+        val_ratio=0.25,
+        seed=0,
+        no_embed_images=True,
+        split_by="source",
+        group_regex=r"^(.*?)_\d+\.png$",
+    )
+    df = script.build_dataset(args)
+    assert set(df["split_group"]) == {f"{lbl}/{c}" for lbl in ("no_possession", "possession") for c in "abcd"}
+    train_groups = set(df.loc[df["split"] == "train", "split_group"])
+    val_groups = set(df.loc[df["split"] == "val", "split_group"])
+    assert len(val_groups) == 2 and not (train_groups & val_groups)
+
+
 class _MetricDataset(Dataset):
     def __init__(self) -> None:
         self.labels = torch.tensor([0] * 10 + [1, 1], dtype=torch.long)

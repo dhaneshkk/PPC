@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import sys
 from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -80,6 +81,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Target ratio for the validation split.")
     parser.add_argument("--seed", type=int, default=42, help="Seed controlling deterministic split assignment.")
     parser.add_argument(
+        "--split-by",
+        choices=("source", "image"),
+        default="source",
+        help=(
+            "Unit of the train/val split. 'source' (default) keeps every image from the same group "
+            "(sub-directory, or --group-regex match) in one split so near-duplicate video frames cannot "
+            "leak from train into val. 'image' reproduces the legacy per-image shuffle."
+        ),
+    )
+    parser.add_argument(
+        "--group-regex",
+        type=str,
+        default=None,
+        help=(
+            "Optional regex applied to each image path relative to its label directory. The first capture "
+            "group (or the whole match) becomes the split group, e.g. '^(.*?)_\\d+\\.png$' groups "
+            "'clipA_000123.png' frames by 'clipA'. Defaults to the parent sub-directory."
+        ),
+    )
+    parser.add_argument(
         "--class-pie-file",
         type=Path,
         default=DEFAULT_CLASS_PIE_FILE,
@@ -149,6 +170,48 @@ def _warn_unknown_label_dirs(data_dir: Path) -> None:
         )
 
 
+def _group_key(path: Path, label_dir: Path, group_pattern: Optional[re.Pattern[str]]) -> str:
+    try:
+        relative = path.resolve().relative_to(label_dir.resolve())
+    except ValueError:
+        relative = Path(path.name)
+    if group_pattern is not None:
+        match = group_pattern.search(relative.as_posix())
+        if match:
+            return match.group(1) if match.groups() else match.group(0)
+        return relative.as_posix()
+    parent = relative.parent.as_posix()
+    return parent if parent not in ("", ".") else "."
+
+
+def _assign_image_split(image_paths: list[Path], val_count: int, rng: random.Random) -> dict[Path, str]:
+    shuffled = list(image_paths)
+    rng.shuffle(shuffled)
+    return {path: "val" if index < val_count else "train" for index, path in enumerate(shuffled)}
+
+
+def _assign_group_split(
+    groups: dict[str, list[Path]], val_count: int, rng: random.Random
+) -> dict[Path, str]:
+    """Greedily move whole groups into val until it reaches the target size."""
+
+    keys = sorted(groups)
+    rng.shuffle(keys)
+    assignment: dict[Path, str] = {}
+    val_total = 0
+    for key in keys:
+        members = groups[key]
+        # Never leave train empty: the last remaining group always stays in train.
+        remaining_train = sum(len(groups[k]) for k in keys) - val_total - len(members)
+        take_val = val_total < val_count and remaining_train > 0
+        split = "val" if take_val else "train"
+        if take_val:
+            val_total += len(members)
+        for path in members:
+            assignment[path] = split
+    return assignment
+
+
 def _build_rows_for_label(
     *,
     label_name: str,
@@ -159,6 +222,8 @@ def _build_rows_for_label(
     val_ratio: float,
     seed: int,
     embed_images: bool,
+    split_by: str = "source",
+    group_regex: Optional[str] = None,
 ) -> list[dict[str, object]]:
     label_dir = data_dir / label_name
     if not label_dir.is_dir():
@@ -169,14 +234,29 @@ def _build_rows_for_label(
         raise RuntimeError(f"No supported image files found under {label_dir}")
 
     rng = random.Random(seed + class_id)
-    rng.shuffle(image_paths)
-
     ratio_total = train_ratio + val_ratio
     val_count = _half_up_count(len(image_paths), val_ratio, ratio_total)
-    split_by_path = {
-        path: "val" if index < val_count else "train"
-        for index, path in enumerate(image_paths)
-    }
+
+    group_pattern = re.compile(group_regex) if group_regex else None
+    groups: dict[str, list[Path]] = {}
+    for path in image_paths:
+        groups.setdefault(_group_key(path, label_dir, group_pattern), []).append(path)
+
+    if split_by == "source" and val_count > 0 and len(groups) < 2:
+        print(
+            f"[warn] {label_name}: only {len(groups)} split group found; falling back to a per-image split. "
+            "Validation frames may be near-duplicates of training frames. Organise images into per-video "
+            "sub-directories or pass --group-regex to get a leakage-free split.",
+            file=sys.stderr,
+        )
+        split_by = "image"
+
+    if split_by == "source":
+        split_by_path = _assign_group_split(groups, val_count, rng)
+    elif split_by == "image":
+        split_by_path = _assign_image_split(image_paths, val_count, rng)
+    else:
+        raise ValueError(f"Unsupported split_by value: {split_by!r}")
 
     rows: list[dict[str, object]] = []
     for path in sorted(image_paths):
@@ -191,6 +271,7 @@ def _build_rows_for_label(
             "class_id": class_id,
             "label": label_name,
             "source": source,
+            "split_group": f"{label_name}/{_group_key(path, label_dir, group_pattern)}",
             "filename": path.name,
         }
         if embed_images:
@@ -223,13 +304,15 @@ def build_dataset(args: argparse.Namespace) -> pd.DataFrame:
                 val_ratio=args.val_ratio,
                 seed=args.seed,
                 embed_images=embed_images,
+                split_by=getattr(args, "split_by", "source"),
+                group_regex=getattr(args, "group_regex", None),
             )
         )
 
     if not rows:
         raise RuntimeError(f"No dataset rows were produced from {data_dir}")
 
-    ordered_columns = ["split", "image_path", "class_id", "label", "source", "filename"]
+    ordered_columns = ["split", "image_path", "class_id", "label", "source", "split_group", "filename"]
     if embed_images:
         ordered_columns.insert(2, "image_bytes")
 
@@ -257,6 +340,15 @@ def _summarize(df: pd.DataFrame) -> None:
     for split in ("train", "val"):
         for label in LABEL_MAP.values():
             print(f"  {split:>5} {label:>16}: {split_label_counts.get((split, label), 0)}")
+
+    if "split_group" in df.columns:
+        groups_per_split = {split: set(df.loc[df["split"] == split, "split_group"]) for split in ("train", "val")}
+        shared = groups_per_split["train"] & groups_per_split["val"]
+        print("Split groups:")
+        for split in ("train", "val"):
+            print(f"  {split:>5}: {len(groups_per_split[split])}")
+        if shared:
+            print(f"  [warn] {len(shared)} group(s) appear in both train and val (per-image split).")
 
 
 def _load_parquet_class_counts(parquet_path: Path) -> Counter[int]:
