@@ -322,39 +322,39 @@ def test_gaze_candidates_use_history_confirmed_ppc_gate() -> None:
         assert bool(candidates) is (frame_index == 9)
 
 
-@pytest.mark.parametrize(
-    "filename",
-    ("demo_phone_gaze_classification.py", "demo_phone_gaze_classification_puc.py"),
-)
-def test_gaze_overlap_uses_1_5x_original_hand_box(filename: str) -> None:
-    demo = _load_script(filename)
+def test_gaze_overlap_uses_2_5x_original_hand_box() -> None:
+    # demo_phone_gaze_classification.py is the only gaze demo; the former *_puc.py variant was
+    # folded into it behind --enable_puc. The shipped expansion is 2.5x the detected hand box.
+    demo = _load_script("demo_phone_gaze_classification.py")
     hand = demo.Box(23, 1.0, 40, 40, 60, 60, 50, 50)
-    assert demo.GAZE_HAND_BOX_EXPANSION == pytest.approx(1.5)
+    assert demo.GAZE_HAND_BOX_EXPANSION == pytest.approx(2.5)
     assert demo.calculate_expanded_box_bounds(
         hand,
         frame_height=100,
         frame_width=100,
         expansion=demo.GAZE_HAND_BOX_EXPANSION,
-    ) == (35, 35, 65, 65)
+    ) == (25, 25, 75, 75)
 
-    heatmap = np.zeros((100, 100), dtype=np.float32)
-    heatmap[50, 75] = 1.0
-    assert demo.gaze_heatmap_overlaps_box(
-        heatmap,
-        hand,
-        frame_height=100,
-        frame_width=100,
-        overlap_ratio=0.8,
-        expansion=demo.GAZE_HAND_BOX_EXPANSION,
-    ) is False
-    assert demo.gaze_heatmap_overlaps_box(
-        heatmap,
-        hand,
-        frame_height=100,
-        frame_width=100,
-        overlap_ratio=0.8,
-        expansion=3.75,
-    ) is True
+    def overlaps(gaze_x: int, expansion: float) -> bool:
+        heatmap = np.zeros((100, 100), dtype=np.float32)
+        heatmap[50, gaze_x] = 1.0
+        return demo.gaze_heatmap_overlaps_box(
+            heatmap,
+            hand,
+            frame_height=100,
+            frame_width=100,
+            overlap_ratio=0.8,
+            expansion=expansion,
+        )
+
+    # Inside the 2.5x box (x2 is exclusive), but outside a 1.5x box (35..65).
+    assert overlaps(70, demo.GAZE_HAND_BOX_EXPANSION) is True
+    assert overlaps(70, 1.5) is False
+    assert overlaps(74, demo.GAZE_HAND_BOX_EXPANSION) is True
+    assert overlaps(75, demo.GAZE_HAND_BOX_EXPANSION) is False
+    # Further out only a larger expansion reaches it.
+    assert overlaps(80, demo.GAZE_HAND_BOX_EXPANSION) is False
+    assert overlaps(80, 3.75) is True
 
 
 @pytest.mark.parametrize("filename", DEMO_FILENAMES)
